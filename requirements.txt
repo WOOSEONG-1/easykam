@@ -1,0 +1,15 @@
+annotated-types
+anyio
+click
+colorama
+fastapi
+h11
+idna
+pip
+pydantic
+pydantic_core
+sniffio
+starlette
+typing_extensions
+typing-inspection
+uvicorn
