@@ -11,7 +11,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/check")
+@app.get("/api/check")
 def health():
     return {"ok": True}
 
