@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    container_name: easykam-api
+    restart: always
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
