@@ -1,13 +1,10 @@
-name: easykam
-
 services:
   api:
     container_name: easykam-api
     build:
-      context: ./fastapi
+      context: ./fastapi          # ✅ 루트(.) 말고 fastapi 폴더를 컨텍스트로
       dockerfile: Dockerfile
     restart: always
-    # 호스트 Nginx만 접근하도록 로컬루프백에 바인딩
     ports:
       - "127.0.0.1:8000:8000"
     environment:
@@ -19,11 +16,9 @@ services:
       context: ./front/easykam
       dockerfile: Dockerfile
     restart: always
-    # 프론트는 호스트 Nginx가 프록시하므로 로컬루프백에 바인딩
     ports:
       - "127.0.0.1:8081:80"
     environment:
       - TZ=Asia/Seoul
-    # api가 먼저 떠있을 필요가 있으면 아래 의존성 사용
     depends_on:
       - api
