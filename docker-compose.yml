@@ -4,8 +4,8 @@ services:
   api:
     container_name: easykam-api
     build:
-      context: .
-      dockerfile: fastapi/Dockerfile
+      context: ./fastapi
+      dockerfile: Dockerfile
     restart: always
     # 호스트 Nginx만 접근하도록 로컬루프백에 바인딩
     ports:

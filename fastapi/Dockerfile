@@ -13,10 +13,11 @@ WORKDIR /app
 
 # 의존성 먼저 설치(캐시 효율)
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 앱 복사
-COPY app.py .
+COPY fastapi/app.py ./app.py
 
 # 컨테이너 내부 포트
 EXPOSE 8000
