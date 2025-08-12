@@ -16,7 +16,7 @@ services:
   web:
     container_name: easykam-web
     build:
-      context: ./front
+      context: ./front/easykam
       dockerfile: Dockerfile
     restart: always
     # 프론트는 호스트 Nginx가 프록시하므로 로컬루프백에 바인딩
