@@ -38,9 +38,6 @@ def ask(payload: AskIn):
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=q,
-            generation_config=types.GenerateContentConfig(
-                temperature=payload.temperature,
-            ),
         )
         return AskOut(answer=resp.text or "")
     except Exception as e:
