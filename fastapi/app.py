@@ -34,18 +34,19 @@ def ask(payload: AskIn):
     q = (payload.question or "").strip()
     if not q:
         raise HTTPException(400, "질문이 비어 있습니다.")
-
     try:
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",            # 모델명
-            contents=q,                          # 문자열만 줘도 SDK가 내부 포맷으로 변환
+            model="gemini-2.5-flash",
+            contents=q,
             generation_config=types.GenerateContentConfig(
                 temperature=payload.temperature,
             ),
         )
         return AskOut(answer=resp.text or "")
     except Exception as e:
-        # 운영 시엔 로깅 후 사용자 메시지는 일반화 추천
+        # ★ 잠깐만 상세 로그
+        import traceback, sys
+        traceback.print_exc(file=sys.stderr)
         raise HTTPException(500, f"Gemini 호출 실패: {e}")
 
 @app.get("/api/check")
