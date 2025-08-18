@@ -36,12 +36,10 @@ def ask(payload: AskIn):
         raise HTTPException(400, "질문이 비어 있습니다.")
     try:
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=q,
-            generation_config=types.GenerateContentConfig(
-                temperature=payload.temperature,
-            ),
-        )
+        model="gemini-2.5-flash",
+        contents=q,
+        temperature=payload.temperature,
+    )
         return AskOut(answer=resp.text or "")
     except Exception as e:
         # ★ 잠깐만 상세 로그

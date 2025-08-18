@@ -7,7 +7,7 @@ click
 colorama
 fastapi
 google-auth
-google-genai
+google-genai>=0.6.0
 h11
 httpcore
 httpx
