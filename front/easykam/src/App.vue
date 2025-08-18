@@ -1,6 +1,6 @@
 <template>
   <main style="max-width:720px;margin:40px auto;font:16px/1.5 system-ui">
-    <img src="./assets/kamco.gif" alt="Easykam Image" style="max-width: 350px;" />s
+    <img src="./assets/kamco.gif" alt="Easykam Image" style="max-width: 350px;" />
     <h1>easyKam</h1>
     <button @click="callApi">Click Me!!</button>
     <input v-model="name" placeholder="name" style="margin-left:8px"/>
