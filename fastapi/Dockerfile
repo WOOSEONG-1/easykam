@@ -5,6 +5,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# ★ CA 인증서 설치 (HTTPS 호출 필수)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 # 의존성
 COPY requirements.txt ./requirements.txt  
 RUN pip install --no-cache-dir -r requirements.txt
