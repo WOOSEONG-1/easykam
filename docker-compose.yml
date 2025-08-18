@@ -13,7 +13,7 @@ services:
     volumes:
       - redis_data:/data
     restart: always
-
+    
   api:
     container_name: easykam-api
     build:
@@ -39,3 +39,6 @@ services:
       - TZ=Asia/Seoul
     depends_on:
       - api
+
+volumes:
+  redis_data: {}
