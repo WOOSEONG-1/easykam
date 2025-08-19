@@ -2,6 +2,8 @@ services:
   redis:
     image: redis:7.2-alpine
     container_name: easykam-redis
+    env_file:
+      - .env
     command: >
       sh -lc '
         test -n "$REDIS_PASSWORD" || { echo "REDIS_PASSWORD missing"; exit 1; }
