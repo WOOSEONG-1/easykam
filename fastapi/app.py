@@ -26,6 +26,10 @@ if not API_KEY:
 
 client = genai.Client(api_key=API_KEY)
 
+import traceback, sys, logging
+logger = logging.getLogger("easykam")
+logging.basicConfig(level=logging.INFO)
+
 class AskIn(BaseModel):
     question: str
     temperature: float | None = 0.2  # 선택: 답변 다양성 제어
@@ -39,6 +43,13 @@ REDIS_PORT = os.getenv("REDIS_PORT", "6379")
 
 redis_url = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/0"
 r = redis.Redis.from_url(redis_url)
+
+# Redis 연결 직후에 간단한 핑 체크(실패 시 로그)
+try:
+    r.ping()
+    logger.info("Redis OK")
+except Exception as e:
+    logger.error("Redis 연결 실패: %s", e)
 
 HIST_MAX = int(os.getenv("CHAT_HISTORY_MAX", "20"))          # 세션당 최근 n개
 HIST_TTL = int(os.getenv("CHAT_HISTORY_TTL_SEC", "3600"))  # 기본 0.7일
@@ -91,37 +102,36 @@ def ask(payload: AskIn, x_session_id: str = Header(default="")):
     if not q:
         raise HTTPException(400, "질문이 비어 있습니다.")
     if not x_session_id:
-        # 프론트는 X-Session-Id를 이미 보내고 있음
         raise HTTPException(400, "세션이 없습니다. X-Session-Id 헤더를 보내주세요.")
 
     try:
-        # 1) 세션 대화 불러오기
+        # 1) 히스토리 로드
         history = get_history(x_session_id)
 
-        # 2) (선택) RAG 컨텍스트 자리. 추후 검색결과를 여기에 문자열로 합쳐 넣으면 됨.
-        context_block = ""  # "\n".join([format_snippet(s) for s in retrieved_snippets])
+        # 2) (옵션) RAG 컨텍스트
+        context_block = ""
 
-        # 3) 프롬프트 구성 (문자열 하나로)
+        # 3) 프롬프트
         prompt = build_prompt(SYSTEM_PROMPT, history, q, context_block)
 
-        # 4) LLM 호출 (구버전 SDK 호환: generation_config/temperature 인자 미사용)
+        # 4) LLM 호출 (구버전 SDK 호환)
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
         )
         answer = getattr(resp, "text", "") or ""
 
-        # 5) 세션 저장
+        # 5) 저장
         append_history(x_session_id, "user", q)
         append_history(x_session_id, "assistant", answer)
 
         return AskOut(answer=answer)
 
     except Exception as e:
-        # 원인 파악이 필요하면 아래 두 줄 잠깐 해제해서 로그 확인하세요.
-        # import traceback, sys
-        # traceback.print_exc(file=sys.stderr)
-        raise HTTPException(500, f"Gemini 호출 실패: {e}")
+        # ★ 어디서 터졌는지 서버 로그로 남김
+        logger.error("ASK 처리 중 오류: %s", e)
+        traceback.print_exc(file=sys.stderr)
+        raise HTTPException(500, f"서버 오류: {e}")
 
 @app.get("/api/check")
 def health():
@@ -130,3 +140,17 @@ def health():
 @app.get("/api/hello")
 def hello(name: str | None = None):
     return {"msg": f"hi {name}" if name else "hi"}
+
+@app.get("/api/diag")
+def diag():
+    import os
+    info = {
+        "has_api_key": bool(os.environ.get("GOOGLE_API_KEY")),
+        "redis_url": os.environ.get("REDIS_URL") or f"redis://:{os.environ.get('REDIS_PASSWORD','?')}@{os.environ.get('REDIS_HOST','redis')}:{os.environ.get('REDIS_PORT','6379')}/0"
+    }
+    # Redis ping
+    try:
+        info["redis_ping"] = r.ping()
+    except Exception as e:
+        info["redis_ping"] = f"ERROR: {e}"
+    return info
