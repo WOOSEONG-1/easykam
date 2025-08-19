@@ -7,6 +7,8 @@ click
 colorama
 fastapi
 google-auth
+redis
+orjson
 google-genai
 h11
 httpcore
