@@ -58,40 +58,52 @@ HIST_TTL = int(os.getenv("CHAT_HISTORY_TTL_SEC", "3600"))  # 기본 0.7일
 def _hist_key(session_id: str) -> str:
     return f"chat:{session_id}:messages"
 
-def get_history(session_id: str) -> List[Dict[str, Any]]:
-    """
-    저장 구조: LPUSH로 최신이 앞에 쌓임 → lrange 후 역순으로 시간순 정렬
-    """
-    k = _hist_key(session_id)
-    items = r.lrange(k, 0, HIST_MAX - 1)
-    msgs = [orjson.loads(x) for x in reversed(items)]
+def get_history(session_id: str) -> list[dict]:
+    """저장 구조: rpush로 오래된→최신 순. 최근 HIST_MAX개만 사용"""
+    key = f"chat:{session_id}"
+    items = r.lrange(key, -HIST_MAX, -1)  # 최신 HIST_MAX개
+    msgs = []
+    for x in items:
+        try:
+            obj = orjson.loads(x)
+            # role/text 필드만 사용하도록 정규화
+            msgs.append({"role": obj.get("role"), "text": obj.get("text") or obj.get("content")})
+        except Exception:
+            # 문자열 등 비정형이 섞여 있어도 안전 처리
+            msgs.append({"role": "user", "text": str(x)})
     return msgs
 
+
+import time  # ← 누락되어 있었던 import
+
 def append_history(session_id: str, role: str, text: str) -> None:
-    k = _hist_key(session_id)
+    key = f"chat:{session_id}"
     payload = {"t": int(time.time()), "role": role, "text": text}
-    pipe = r.pipeline()
-    pipe.lpush(k, orjson.dumps(payload).decode())
-    pipe.ltrim(k, 0, HIST_MAX - 1)
-    pipe.expire(k, HIST_TTL)
-    pipe.execute()
+    r.rpush(key, orjson.dumps(payload).decode())
+    r.ltrim(key, -HIST_MAX, -1)
+    r.expire(key, HIST_TTL)
+
 
 def build_prompt(history: list[str], q: str, context_block: str | None = None) -> str:
     """히스토리 + 사용자 질문 + context를 합쳐 최종 prompt 문자열 생성"""
-    parts = []
+    parts: list[str] = []
 
     if history:
-        parts.append("### 대화 히스토리:")
-        parts.extend(history)
+        parts.append("### 대화 히스토리(최신이 하단):")
+        for m in history:
+            role = m.get("role", "")
+            text = (m.get("text") or m.get("content") or "").strip()
+            who = "사용자" if role == "user" else "어시스턴트"
+            parts.append(f"{who}: {text}")
 
     if context_block:
         parts.append("### 참고 컨텍스트:")
-        parts.append(context_block)
+        parts.append(context_block.strip())
 
     parts.append("### 사용자 질문:")
-    parts.append(q)
+    parts.append(q.strip())
 
-    return "\n\n".join(parts)
+    return "\n\n".join(str(x) for x in parts if str(x).strip())
 
 # def build_prompt(system_prompt: str, history: List[Dict[str, Any]], user_q: str, context_block: str = "") -> str:
 #     """
