@@ -3,9 +3,12 @@ services:
     image: redis:7.2-alpine
     container_name: easykam-redis
     command: >
-      sh -c "redis-server --appendonly yes --save 60 1000
-             --requirepass $$REDIS_PASSWORD
-             --maxmemory-policy allkeys-lru"
+      sh -lc '
+        test -n "$REDIS_PASSWORD" || { echo "REDIS_PASSWORD missing"; exit 1; }
+        exec redis-server --appendonly yes --save 60 1000
+          --requirepass "$REDIS_PASSWORD"           
+          --maxmemory-policy allkeys-lru
+      '
     ports:
       - "0.0.0.0:6379:6379"      # 로컬만 허용 (필요 시 0.0.0.0으로)
     environment:
