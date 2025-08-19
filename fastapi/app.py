@@ -75,26 +75,43 @@ def append_history(session_id: str, role: str, text: str) -> None:
     pipe.expire(k, HIST_TTL)
     pipe.execute()
 
-def build_prompt(system_prompt: str, history: List[Dict[str, Any]], user_q: str, context_block: str = "") -> str:
-    """
-    SDK 버전에 상관없이 가장 호환성 높은 형태:
-    대화기록을 사람이 읽는 포맷으로 묶어 하나의 문자열 프롬프트로 전달
-    """
-    lines = [f"[시스템]\n{system_prompt}"]
-    if context_block:
-        lines.append(f"\n[검색근거]\n{context_block}")
+def build_prompt(history: list[str], q: str, context_block: str | None = None) -> str:
+    """히스토리 + 사용자 질문 + context를 합쳐 최종 prompt 문자열 생성"""
+    parts = []
 
     if history:
-        lines.append("\n[대화기록(최신 하단)]")
-        for m in history:
-            who = "사용자" if m.get("role") == "user" else "어시스턴트"
-            lines.append(f"- {who}: {m.get('text','').strip()}")
+        parts.append("### 대화 히스토리:")
+        parts.extend(history)
 
-    lines.append("\n[현재질문]")
-    lines.append(user_q.strip())
-    lines.append("\n[지시]\n위의 [검색근거]와 [대화기록]만을 근거로, "
-                 "답변 마지막에 참고한 근거를 [1][2]처럼 표기하세요. 불확실하면 추가 질문을 하세요.")
-    return "\n".join(lines)
+    if context_block:
+        parts.append("### 참고 컨텍스트:")
+        parts.append(context_block)
+
+    parts.append("### 사용자 질문:")
+    parts.append(q)
+
+    return "\n\n".join(parts)
+
+# def build_prompt(system_prompt: str, history: List[Dict[str, Any]], user_q: str, context_block: str = "") -> str:
+#     """
+#     SDK 버전에 상관없이 가장 호환성 높은 형태:
+#     대화기록을 사람이 읽는 포맷으로 묶어 하나의 문자열 프롬프트로 전달
+#     """
+#     lines = [f"[시스템]\n{system_prompt}"]
+#     if context_block:
+#         lines.append(f"\n[검색근거]\n{context_block}")
+
+#     if history:
+#         lines.append("\n[대화기록(최신 하단)]")
+#         for m in history:
+#             who = "사용자" if m.get("role") == "user" else "어시스턴트"
+#             lines.append(f"- {who}: {m.get('text','').strip()}")
+
+#     lines.append("\n[현재질문]")
+#     lines.append(user_q.strip())
+#     lines.append("\n[지시]\n위의 [검색근거]와 [대화기록]만을 근거로, "
+#                  "답변 마지막에 참고한 근거를 [1][2]처럼 표기하세요. 불확실하면 추가 질문을 하세요.")
+#     return "\n".join(lines)
 
 @app.post("/api/ask", response_model=AskOut)
 def ask(payload: AskIn, x_session_id: str = Header(default="")):
@@ -105,30 +122,29 @@ def ask(payload: AskIn, x_session_id: str = Header(default="")):
         raise HTTPException(400, "세션이 없습니다. X-Session-Id 헤더를 보내주세요.")
 
     try:
-        # 1) 히스토리 로드
+        # 1) Redis에서 대화 히스토리 불러오기
         history = get_history(x_session_id)
 
-        # 2) (옵션) RAG 컨텍스트
+        # 2) (옵션) RAG 컨텍스트 (현재는 빈 값, 추후 확장 가능)
         context_block = ""
 
-        # 3) 프롬프트
-        prompt = build_prompt(SYSTEM_PROMPT, history, q, context_block)
+        # 3) 프롬프트 생성
+        prompt = build_prompt(history, q, context_block)
 
-        # 4) LLM 호출 (구버전 SDK 호환)
+        # 4) LLM 호출
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
         )
         answer = getattr(resp, "text", "") or ""
 
-        # 5) 저장
+        # 5) Redis에 저장
         append_history(x_session_id, "user", q)
         append_history(x_session_id, "assistant", answer)
 
         return AskOut(answer=answer)
 
     except Exception as e:
-        # ★ 어디서 터졌는지 서버 로그로 남김
         logger.error("ASK 처리 중 오류: %s", e)
         traceback.print_exc(file=sys.stderr)
         raise HTTPException(500, f"서버 오류: {e}")
