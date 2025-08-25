@@ -6,6 +6,8 @@ charset-normalizer
 click
 colorama
 fastapi
+faiss-cpu
+sentence-transformers
 google-auth
 redis
 orjson
