@@ -23,6 +23,13 @@ services:
       - TZ=Asia/Seoul
     env_file:
       - .env
+    environment:
+      - DATA_JSONL_PATH=/app/data.jsonl
+      - FAISS_INDEX_PATH=/app/faiss_index.bin
+      - EMBED_MODEL_NAME=BAAI/bge-m3
+    volumes:
+      - ./data.jsonl:/app/data.jsonl:ro
+      - ./faiss_index.bin:/app/faiss_index.bin  # (최초 없음 가능)
 
   web:
     container_name: easykam-web
