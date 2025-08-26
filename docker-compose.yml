@@ -27,7 +27,7 @@ services:
     env_file:
       - .env
     volumes:
-      - - ./data:/app/data:ro
+      - ./data:/app/data:ro
       - ./faiss_index.bin:/app/faiss_index.bin  # (최초 없음 가능)
 
   web:
