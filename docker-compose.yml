@@ -21,13 +21,13 @@ services:
       - "127.0.0.1:8000:8000"
     environment:
       - TZ=Asia/Seoul
-      - DATA_JSONL_PATH=/app/data.jsonl
+      - DATA_JSONL=/app/data/data.jsonl
       - FAISS_INDEX_PATH=/app/faiss_index.bin
       - EMBED_MODEL_NAME=BAAI/bge-m3
     env_file:
       - .env
     volumes:
-      - ./data.jsonl:/app/data.jsonl:ro
+      - - ./data:/app/data:ro
       - ./faiss_index.bin:/app/faiss_index.bin  # (최초 없음 가능)
 
   web:
