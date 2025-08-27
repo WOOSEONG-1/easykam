@@ -19,18 +19,15 @@ services:
     restart: always
     ports:
       - "127.0.0.1:8000:8000"
-    # 루트의 ./data 를 컨테이너 /app/data 로 read-only 마운트
-    volumes:
-      - ./data:/app/data:ro
     environment:
-      - TZ=Asia/Seoul
-      # RAG 파일 경로를 환경변수로 고정
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - DATA_JSONL=/app/data/data.jsonl
       - FAISS_INDEX_PATH=/app/data/faiss_index.bin
-      # Redis (필요에 맞춰 조정)
-      - REDIS_HOST=easykam-redis
-      - REDIS_PORT=6379
-      # GOOGLE_API_KEY 등은 .env로 주입
+      - EMBED_MODEL_NAME=BAAI/bge-m3
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data:rw  # ← data.jsonl & faiss_index.bin
     env_file:
       - .env
     depends_on:
