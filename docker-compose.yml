@@ -17,8 +17,6 @@ services:
       context: ./fastapi
       dockerfile: Dockerfile
     restart: always
-    ports:
-      - "127.0.0.1:8000:8000"
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - DATA_JSONL=/app/data/data.jsonl
