@@ -1,66 +1,62 @@
 import os
 import sys
-import time
 import json
-import orjson
+import time
+import logging
 import traceback
 from typing import List, Dict, Any, Tuple
+
+import orjson
+import redis
+import numpy as np
+import faiss
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-import redis
-import faiss
-from sentence_transformers import SentenceTransformer
-
 from google import genai
 from google.genai import types
 
+from sentence_transformers import SentenceTransformer
+from threading import Lock
+
 # ---------------------------
-# App & CORS
+# 기본 설정 / 로거
 # ---------------------------
+logger = logging.getLogger("easykam")
+logging.basicConfig(level=logging.INFO)
+
 app = FastAPI(title="easykam")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 배포 시 도메인으로 제한 권장
+    allow_origins=["*"],   # ["https://easykam.life"] 로 바꿀 수 있음
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------
-# Env / Paths
+# 환경변수
 # ---------------------------
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_JSONL = os.getenv("DATA_JSONL", os.path.normpath(os.path.join(ROOT_DIR, "../data/data.jsonl")))
-FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", os.path.normpath(os.path.join(ROOT_DIR, "../data/faiss_index.bin")))
-
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-small-ko")  # ← bge-ko
-TOPK = int(os.getenv("RAG_TOPK", "3"))
-
 API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY 가 없습니다.")
+    raise RuntimeError("API KEY가 없습니다. (GOOGLE_API_KEY)")
 
-client = genai.Client(api_key=API_KEY)
+# RAG 파일 경로 (반드시 docker-compose에서 볼륨/파일 매핑)
+DATA_JSONL = os.environ.get("DATA_JSONL", "/app/data/data.jsonl")
+FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "/app/data/faiss_index.bin")
 
-# ---------------------------
-# Logging
-# ---------------------------
-import logging
-logger = logging.getLogger("easykam")
-logging.basicConfig(level=logging.INFO)
+# 검색 상수
+TOPK = int(os.environ.get("RAG_TOPK", "3"))
 
-# ---------------------------
-# Redis
-# ---------------------------
+# Redis (기존 코드 유지)
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 REDIS_HOST = os.getenv("REDIS_HOST", "easykam-redis")
 REDIS_PORT = os.getenv("REDIS_PORT", "6379")
-redis_url = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/0" if REDIS_PASSWORD else f"redis://{REDIS_HOST}:{REDIS_PORT}/0"
-r = redis.Redis.from_url(redis_url)
 
+redis_url = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/0"
+r = redis.Redis.from_url(redis_url)
 try:
     r.ping()
     logger.info("Redis OK")
@@ -70,10 +66,13 @@ except Exception as e:
 HIST_MAX = int(os.getenv("CHAT_HISTORY_MAX", "20"))
 HIST_TTL = int(os.getenv("CHAT_HISTORY_TTL_SEC", "3600"))
 
-def get_history(session_id: str) -> List[Dict[str, str]]:
+def _hist_key(session_id: str) -> str:
+    return f"chat:{session_id}:messages"
+
+def get_history(session_id: str) -> list[dict]:
     key = f"chat:{session_id}"
-    items = r.lrange(key, -HIST_MAX, -1)
-    msgs: List[Dict[str, str]] = []
+    items = r.lrange(key, -HIST_MAX, -1)  # 최신 HIST_MAX개
+    msgs = []
     for x in items:
         try:
             obj = orjson.loads(x)
@@ -90,118 +89,189 @@ def append_history(session_id: str, role: str, text: str) -> None:
     r.expire(key, HIST_TTL)
 
 # ---------------------------
-# RAG Globals
+# LLM 클라이언트
 # ---------------------------
-EMBED_MODEL: SentenceTransformer | None = None
-FAISS_INDEX: faiss.Index | None = None
-DOCS: List[Dict[str, Any]] = []   # JSONL 라인들의 리스트 (chunks)
+client = genai.Client(api_key=API_KEY)
 
-def _load_docs(jsonl_path: str) -> List[Dict[str, Any]]:
-    if not os.path.isfile(jsonl_path):
-        logger.warning("JSONL이 없습니다: %s", jsonl_path)
-        return []
-    docs: List[Dict[str, Any]] = []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
+# ---------------------------
+# 임베딩 / FAISS (글로벌 상태)
+# ---------------------------
+EMBED_MODEL_NAME = os.environ.get("EMBED_MODEL_NAME", "BAAI/bge-m3")
+# bge-m3 권장 인스트럭션(검색/문서 임베딩에 도움)
+Q_PREFIX = "Represent this sentence for retrieval: "
+D_PREFIX = "Represent this document for retrieval: "
+
+EMBED_MODEL: SentenceTransformer | None = None
+FAISS_INDEX: faiss.IndexFlatIP | None = None
+DOCS: List[Dict[str, Any]] = []   # [{"id","title","type","content"}...]
+RAG_LOCK = Lock()
+
+def _load_embed_model() -> SentenceTransformer:
+    logger.info("Loading SentenceTransformer: %s", EMBED_MODEL_NAME)
+    model = SentenceTransformer(EMBED_MODEL_NAME)
+    logger.info("SentenceTransformer loaded: %s", EMBED_MODEL_NAME)
+    return model
+
+def _embed_texts(texts: List[str], is_query=False) -> np.ndarray:
+    assert EMBED_MODEL is not None
+    if is_query:
+        texts = [Q_PREFIX + t for t in texts]
+    else:
+        texts = [D_PREFIX + t for t in texts]
+    vecs = EMBED_MODEL.encode(texts, batch_size=8, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
+    return vecs.astype("float32")
+
+def _read_jsonl(path: str) -> List[Dict[str, Any]]:
+    docs = []
+    if not os.path.exists(path) or not os.path.isfile(path):
+        logger.warning("JSONL이 없습니다: %s", path)
+        return docs
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
-                # 최소 필드 보정
-                if "content" in obj and isinstance(obj["content"], str):
-                    docs.append(obj)
+                # 필수 필드 보정
+                if "content" not in obj or not obj["content"]:
+                    continue
+                obj.setdefault("title", obj.get("id", ""))
+                obj.setdefault("type", "regulation")
+                docs.append(obj)
             except Exception:
                 continue
     logger.info("Docs loaded: %d", len(docs))
     return docs
 
-def _init_rag_or_die() -> None:
-    """임베딩 모델 / 문서 / FAISS 인덱스 로드. 실패 시 프로세스 종료."""
-    global EMBED_MODEL, DOCS, FAISS_INDEX
+def _build_faiss(docs: List[Dict[str, Any]], index_path: str) -> faiss.IndexFlatIP:
+    if not docs:
+        raise RuntimeError("빌드할 문서가 없습니다.")
 
-    # 1) 임베딩 모델
-    logger.info("Loading SentenceTransformer: %s", EMBED_MODEL_NAME)
-    EMBED_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
-    logger.info("SentenceTransformer loaded: %s", EMBED_MODEL_NAME)
+    # 문서 임베딩 (content 사용)
+    contents = [d["content"] for d in docs]
+    embs = _embed_texts(contents, is_query=False)  # (N, dim), L2 normed
+    dim = embs.shape[1]
+    index = faiss.IndexFlatIP(dim)  # inner product
+    index.add(embs)
 
-    # 2) 문서 로드
-    DOCS = _load_docs(DATA_JSONL)
-    if not DOCS:
-        logger.error("RAG 초기화 실패: 문서가 없습니다 (%s)", DATA_JSONL)
-        sys.exit(1)
+    # 저장
+    faiss.write_index(index, index_path)
+    logger.info("FAISS index built & saved: %s (docs=%d, dim=%d)", index_path, len(docs), dim)
+    return index
 
-    # 3) FAISS 인덱스 로드
-    if not os.path.exists(FAISS_INDEX_PATH) or not os.path.isfile(FAISS_INDEX_PATH):
-        logger.error("RAG 초기화 실패: FAISS 인덱스가 없습니다 (%s)", FAISS_INDEX_PATH)
-        sys.exit(1)
-    try:
-        FAISS_INDEX = faiss.read_index(FAISS_INDEX_PATH)
-        logger.info("FAISS index loaded: %s", FAISS_INDEX_PATH)
-    except Exception as e:
-        logger.error("FAISS 로드 실패: %s", e)
-        sys.exit(1)
+def _load_faiss(index_path: str) -> faiss.IndexFlatIP:
+    if not os.path.exists(index_path) or not os.path.isfile(index_path):
+        raise FileNotFoundError(f"FAISS 인덱스가 없습니다: {index_path}")
+    index = faiss.read_index(index_path)
+    logger.info("FAISS index loaded: %s", index_path)
+    return index
 
-def encode_query(text: str):
-    """bge-ko 쿼리 임베딩 (정규화 권장)"""
-    v = EMBED_MODEL.encode([text], normalize_embeddings=True)
-    return v
-
-def rag_search(query: str, topk: int = TOPK) -> List[Dict[str, Any]]:
-    """FAISS로 topk 문서/청크 반환"""
-    if not FAISS_INDEX or not DOCS:
-        return []
-    qv = encode_query(query)
-    D, I = FAISS_INDEX.search(qv, topk)
-    hits: List[Dict[str, Any]] = []
-    for idx in I[0]:
-        if 0 <= idx < len(DOCS):
-            hits.append(DOCS[idx])
-    return hits
-
-def build_prompt(history: List[Dict[str, str]], q: str, contexts: List[Dict[str, Any]]) -> str:
+def _init_rag_or_die():
     """
-    초기 프롬프트 정책:
-    - 컨텍스트(내규)가 있으면: 해당 문서를 근거로 답변 + 관련 법령/사례(요약·설명·링크) 추가
-    - 없으면: 문서 없이 질문만 전달(일반 질의응답)
+    - 인덱스가 있으면 로드
+    - 없고 JSONL이 있으면 빌드 후 로드
+    - 둘 다 없으면 서비스 종료
     """
-    parts: List[str] = []
-    if contexts:
-        parts.append(
-            "### 규정 컨텍스트(내규 원문 발췌)\n"
-            "아래는 질문과 관련성이 높은 내규 전문/청크입니다. 이 내용을 우선 근거로 답변하세요.\n"
-        )
-        for i, c in enumerate(contexts, start=1):
-            title = c.get("title") or c.get("id") or f"doc-{i}"
-            ctype = c.get("type", "regulation")
-            content = (c.get("content") or "").strip()
-            parts.append(f"[{i}] 제목: {title} ({ctype})\n{content}\n")
-        parts.append(
-            "### 지시\n"
-            "1) 위 컨텍스트를 중심으로 질문에 답하세요.\n"
-            "2) 답변 끝부분에 관련 법령/시행령/조례 및 사례를 선정·요약·설명하고, 가능한 경우 링크를 제공하세요.\n"
-            "3) 컨텍스트에 포함되지 않은 내용은 추측하지 말고, 모호하면 추가 질문을 제안하세요.\n"
-        )
-    else:
-        parts.append(
-            "### 지시\n"
-            "컨텍스트가 없으므로 일반 질의응답으로 답하세요. 가능하면 관련 법령/시행령/조례 및 사례도 요약·설명하고 링크를 제시하세요.\n"
+    global EMBED_MODEL, FAISS_INDEX, DOCS
+    with RAG_LOCK:
+        # 임베딩 모델
+        EMBED_MODEL = _load_embed_model()
+
+        # 문서
+        DOCS = _read_jsonl(DATA_JSONL)
+
+        # 인덱스
+        if os.path.isfile(FAISS_INDEX_PATH):
+            try:
+                FAISS_INDEX = _load_faiss(FAISS_INDEX_PATH)
+                return
+            except Exception as e:
+                logger.error("FAISS 로드 실패: %s", e)
+
+        # 없으면 빌드 시도
+        if DOCS:
+            try:
+                FAISS_INDEX = _build_faiss(DOCS, FAISS_INDEX_PATH)
+                return
+            except Exception as e:
+                logger.error("FAISS 빌드 실패: %s", e)
+
+        # 여기 오면 RAG 사용할 수 없음 → 서비스 중단
+        raise RuntimeError(
+            f"RAG 초기화 실패: 인덱스({FAISS_INDEX_PATH})/JSONL({DATA_JSONL}) 확인 필요"
         )
 
-    if history:
-        parts.append("### 대화 히스토리(최신이 하단)")
-        for m in history:
-            who = "사용자" if m.get("role") == "user" else "어시스턴트"
-            text = (m.get("text") or "").strip()
-            parts.append(f"- {who}: {text}")
+def rag_search(query: str, topk: int = TOPK) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    질의 임베딩 → FAISS 상위 topk → 컨텍스트 블록 문자열과 문서 메타 반환
+    """
+    if FAISS_INDEX is None or EMBED_MODEL is None or not DOCS:
+        return "", []
 
-    parts.append("### 사용자 질문")
-    parts.append(q.strip())
+    qv = _embed_texts([query], is_query=True)  # (1, dim)
+    D, I = FAISS_INDEX.search(qv, topk)        # I: (1, topk) 인덱스
+    idxs = I[0].tolist()
+    scores = D[0].tolist()
 
-    return "\n\n".join(parts)
+    found = []
+    parts = []
+    for rank, (i, score) in enumerate(zip(idxs, scores), start=1):
+        if i < 0 or i >= len(DOCS):
+            continue
+        doc = DOCS[i]
+        found.append({"rank": rank, "score": float(score), "doc": doc})
+        # 컨텍스트 블록(문서 제목과 본문)
+        title = doc.get("title") or doc.get("id") or f"문서#{i}"
+        body = doc.get("content", "")
+        parts.append(f"[{rank}] 제목: {title}\n{body}")
+
+    context_block = "\n\n----------------\n\n".join(parts).strip()
+    return context_block, found
 
 # ---------------------------
-# Pydantic
+# 프롬프트 빌더
+# ---------------------------
+def build_prompt_with_rag(q: str, history: List[Dict[str, Any]], context_block: str | None) -> str:
+    """
+    검색 결과가 있으면: 문서 위주로 답변 + 관련 법령·사례 “서술”
+    없으면: 질문만 넘김
+    """
+    sys_inst = (
+        "당신은 공공기관 내규 안내 도우미입니다. "
+        "아래 '참고 문서'가 있으면 그 문서의 내용을 우선적으로 근거로 하여, "
+        "질문에 직접적으로 필요한 항목만 구조적으로 설명하세요. "
+        "참고 문서에 포함되지 않은 경우에도, 관련 법령과 실제 사례(공개된 판례/보도자료 수준)를 "
+        "적절히 보충해 설명하세요. 단, 법령/사례는 링크나 정확한 명칭을 함께 제시하세요. "
+        "불확실하면 명확히 불확실하다고 말하고 추가 질문을 제안하세요."
+    )
+
+    parts = [f"[시스템]\n{sys_inst}"]
+
+    if context_block:
+        parts.append("\n[참고 문서]\n")
+        parts.append(context_block)
+
+    if history:
+        parts.append("\n[대화기록(최신 하단)]")
+        for m in history:
+            who = "사용자" if m.get("role") == "user" else "어시스턴트"
+            parts.append(f"- {who}: {m.get('text','').strip()}")
+
+    parts.append("\n[질문]")
+    parts.append(q.strip())
+
+    parts.append(
+        "\n[지시]\n"
+        "- 불필요한 장황한 설명은 피하고 항목별로 정리해서 답하세요.\n"
+        "- 가능한 경우 관련 법령과 사례를 함께 제시하세요(링크/정확 명칭 포함).\n"
+        "- 참고 문서의 핵심 조항/절차를 그대로 인용하지 말고, 질문 맥락에 맞게 재서술하세요."
+    )
+
+    return "\n".join(parts)
+
+# ---------------------------
+# API 모델
 # ---------------------------
 class AskIn(BaseModel):
     question: str
@@ -211,21 +281,19 @@ class AskOut(BaseModel):
     answer: str
 
 # ---------------------------
-# Startup: RAG 반드시 성공해야 기동
+# FastAPI 핸들러
 # ---------------------------
 @app.on_event("startup")
 def on_startup():
     try:
         _init_rag_or_die()
-    except SystemExit:
-        raise
     except Exception as e:
         logger.error("RAG 초기화 중 예외: %s", e)
+        # 전체 스택 출력
+        traceback.print_exc()
+        # 서비스 기동 중단
         sys.exit(1)
 
-# ---------------------------
-# Routes
-# ---------------------------
 @app.post("/api/ask", response_model=AskOut)
 def ask(payload: AskIn, x_session_id: str = Header(default="")):
     q = (payload.question or "").strip()
@@ -235,21 +303,27 @@ def ask(payload: AskIn, x_session_id: str = Header(default="")):
         raise HTTPException(400, "세션이 없습니다. X-Session-Id 헤더를 보내주세요.")
 
     try:
+        # 1) 히스토리
         history = get_history(x_session_id)
-        # RAG 검색
-        contexts = rag_search(q, topk=TOPK)
 
-        # 프롬프트 생성
-        prompt = build_prompt(history, q, contexts)
+        # 2) RAG 검색
+        context_block, _found = rag_search(q, topk=TOPK)
+        has_context = bool(context_block)
 
-        # LLM 호출 (단일 프롬프트)
+        # 3) 프롬프트
+        prompt = build_prompt_with_rag(q, history, context_block if has_context else None)
+
+        # 4) LLM 호출
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
+            generation_config=types.GenerateContentConfig(
+                temperature=payload.temperature or 0.2
+            ),
         )
         answer = getattr(resp, "text", "") or ""
 
-        # 히스토리 저장
+        # 5) 히스토리 저장
         append_history(x_session_id, "user", q)
         append_history(x_session_id, "assistant", answer)
 
@@ -257,25 +331,31 @@ def ask(payload: AskIn, x_session_id: str = Header(default="")):
 
     except Exception as e:
         logger.error("ASK 처리 중 오류: %s", e)
-        traceback.print_exc(file=sys.stderr)
+        traceback.print_exc()
         raise HTTPException(500, f"서버 오류: {e}")
 
 @app.get("/api/check")
 def health():
+    return {
+        "ok_gemini": bool(API_KEY),
+        "ok_redis": True
+    }
+
+@app.get("/api/hello")
+def hello(name: str | None = None):
+    return {"msg": f"hi {name}" if name else "hi"}
+
+@app.get("/api/diag")
+def diag():
     info = {
         "has_api_key": bool(API_KEY),
         "data_jsonl": DATA_JSONL,
         "faiss_index": FAISS_INDEX_PATH,
-        "docs_loaded": len(DOCS),
-        "embed_model": EMBED_MODEL_NAME,
+        "docs": len(DOCS),
+        "index_ready": FAISS_INDEX is not None,
     }
-    # Redis ping
     try:
         info["redis_ping"] = r.ping()
     except Exception as e:
         info["redis_ping"] = f"ERROR: {e}"
     return info
-
-@app.get("/api/hello")
-def hello(name: str | None = None):
-    return {"msg": f"hi {name}" if name else "hi"}
