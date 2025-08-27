@@ -14,21 +14,27 @@ services:
   api:
     container_name: easykam-api
     build:
-      context: ./fastapi          # ✅ 루트(.) 말고 fastapi 폴더를 컨텍스트로
+      context: ./fastapi
       dockerfile: Dockerfile
     restart: always
     ports:
       - "127.0.0.1:8000:8000"
-    environment:
-      - TZ=Asia/Seoul
-      - DATA_JSONL=/app/data/data.jsonl
-      - FAISS_INDEX_PATH=/app/faiss_index.bin
-      - EMBED_MODEL_NAME=BAAI/bge-m3
-    env_file:
-      - .env
+    # 루트의 ./data 를 컨테이너 /app/data 로 read-only 마운트
     volumes:
       - ./data:/app/data:ro
-      - ./faiss_index.bin:/app/faiss_index.bin  # (최초 없음 가능)
+    environment:
+      - TZ=Asia/Seoul
+      # RAG 파일 경로를 환경변수로 고정
+      - DATA_JSONL=/app/data/data.jsonl
+      - FAISS_INDEX_PATH=/app/data/faiss_index.bin
+      # Redis (필요에 맞춰 조정)
+      - REDIS_HOST=easykam-redis
+      - REDIS_PORT=6379
+      # GOOGLE_API_KEY 등은 .env로 주입
+    env_file:
+      - .env
+    depends_on:
+      - redis
 
   web:
     container_name: easykam-web

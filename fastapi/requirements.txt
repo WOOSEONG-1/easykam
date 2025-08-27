@@ -11,6 +11,8 @@ sentence-transformers
 google-auth
 redis
 orjson
+torch
+loguru
 google-genai
 h11
 httpcore

@@ -1,50 +1,54 @@
-# -*- coding: utf-8 -*-
 import os
 import sys
 import time
-import faiss
+import json
 import orjson
-import redis
-import numpy as np
 import traceback
-import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Tuple
+
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+import redis
+import faiss
 from sentence_transformers import SentenceTransformer
+
 from google import genai
+from google.genai import types
 
 # ---------------------------
-# 설정 (경로/모델/ENV)
-# ---------------------------
-DATA_JSONL_PATH = os.getenv("DATA_JSONL_PATH", "/app/data.jsonl")
-FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "/app/faiss_index.bin")
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-m3")  # 한국어 포함 다국어 BGE
-
-HIST_MAX = int(os.getenv("CHAT_HISTORY_MAX", "20"))
-HIST_TTL = int(os.getenv("CHAT_HISTORY_TTL_SEC", "3600"))
-
-API_KEY = os.environ.get("GOOGLE_API_KEY")
-if not API_KEY:
-    raise RuntimeError("API KEY가 없습니다.")
-client = genai.Client(api_key=API_KEY)
-
-# ---------------------------
-# FastAPI / CORS
+# App & CORS
 # ---------------------------
 app = FastAPI(title="easykam")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 필요 시 도메인 제한
+    allow_origins=["*"],  # 배포 시 도메인으로 제한 권장
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------
-# 로거
+# Env / Paths
 # ---------------------------
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_JSONL = os.getenv("DATA_JSONL", os.path.normpath(os.path.join(ROOT_DIR, "../data/data.jsonl")))
+FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", os.path.normpath(os.path.join(ROOT_DIR, "../data/faiss_index.bin")))
+
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-small-ko")  # ← bge-ko
+TOPK = int(os.getenv("RAG_TOPK", "3"))
+
+API_KEY = os.environ.get("GOOGLE_API_KEY")
+if not API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY 가 없습니다.")
+
+client = genai.Client(api_key=API_KEY)
+
+# ---------------------------
+# Logging
+# ---------------------------
+import logging
 logger = logging.getLogger("easykam")
 logging.basicConfig(level=logging.INFO)
 
@@ -54,19 +58,22 @@ logging.basicConfig(level=logging.INFO)
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 REDIS_HOST = os.getenv("REDIS_HOST", "easykam-redis")
 REDIS_PORT = os.getenv("REDIS_PORT", "6379")
-
-redis_url = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/0"
+redis_url = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/0" if REDIS_PASSWORD else f"redis://{REDIS_HOST}:{REDIS_PORT}/0"
 r = redis.Redis.from_url(redis_url)
+
 try:
     r.ping()
     logger.info("Redis OK")
 except Exception as e:
     logger.error("Redis 연결 실패: %s", e)
 
-def get_history(session_id: str) -> list[dict]:
+HIST_MAX = int(os.getenv("CHAT_HISTORY_MAX", "20"))
+HIST_TTL = int(os.getenv("CHAT_HISTORY_TTL_SEC", "3600"))
+
+def get_history(session_id: str) -> List[Dict[str, str]]:
     key = f"chat:{session_id}"
     items = r.lrange(key, -HIST_MAX, -1)
-    msgs = []
+    msgs: List[Dict[str, str]] = []
     for x in items:
         try:
             obj = orjson.loads(x)
@@ -83,112 +90,118 @@ def append_history(session_id: str, role: str, text: str) -> None:
     r.expire(key, HIST_TTL)
 
 # ---------------------------
-# 전역 RAG 상태 (메모리 상주)
+# RAG Globals
 # ---------------------------
-embedder: Optional[SentenceTransformer] = None
-docs_mem: Optional[List[Dict[str, Any]]] = None
-faiss_index: Optional[faiss.Index] = None
-dim: Optional[int] = None
+EMBED_MODEL: SentenceTransformer | None = None
+FAISS_INDEX: faiss.Index | None = None
+DOCS: List[Dict[str, Any]] = []   # JSONL 라인들의 리스트 (chunks)
 
-def _load_docs(path: str) -> List[Dict[str, Any]]:
-    docs = []
-    if not os.path.exists(path):
-        logger.warning("JSONL이 없습니다: %s", path)
-        return docs
-    with open(path, "r", encoding="utf-8") as f:
+def _load_docs(jsonl_path: str) -> List[Dict[str, Any]]:
+    if not os.path.isfile(jsonl_path):
+        logger.warning("JSONL이 없습니다: %s", jsonl_path)
+        return []
+    docs: List[Dict[str, Any]] = []
+    with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
-            if line.strip():
-                docs.append(orjson.loads(line))
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                # 최소 필드 보정
+                if "content" in obj and isinstance(obj["content"], str):
+                    docs.append(obj)
+            except Exception:
+                continue
+    logger.info("Docs loaded: %d", len(docs))
     return docs
 
-def _encode_texts(texts: List[str]) -> np.ndarray:
-    vecs = embedder.encode(texts, normalize_embeddings=True)
-    return np.asarray(vecs, dtype="float32")
+def _init_rag_or_die() -> None:
+    """임베딩 모델 / 문서 / FAISS 인덱스 로드. 실패 시 프로세스 종료."""
+    global EMBED_MODEL, DOCS, FAISS_INDEX
 
-def _build_index(docs: List[Dict[str, Any]]) -> faiss.Index:
-    global dim
-    if not docs:
-        # 비어있는 인덱스도 만들 수 있게 최소 1차원이라도 필요하지만,
-        # 여기서는 문서가 없을 때 검색을 스킵하도록 처리
-        raise RuntimeError("인덱스 빌드 실패: 문서가 없습니다.")
-    texts = [d.get("content", "") for d in docs]
-    vecs = _encode_texts(texts)
-    dim = vecs.shape[1]
-    index = faiss.IndexFlatIP(dim)  # cosine 유사도용
-    index.add(vecs)
-    faiss.write_index(index, FAISS_INDEX_PATH)
-    logger.info("FAISS index built & saved: %s (docs=%d, dim=%d)", FAISS_INDEX_PATH, len(docs), dim)
-    return index
-
-def _load_index_or_build():
-    """서버 기동 시: 인덱스 파일이 있으면 로드, 없으면 JSONL로부터 빌드."""
-    global embedder, docs_mem, faiss_index, dim
-    # 임베더 준비
-    embedder = SentenceTransformer(EMBED_MODEL_NAME)
+    # 1) 임베딩 모델
+    logger.info("Loading SentenceTransformer: %s", EMBED_MODEL_NAME)
+    EMBED_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
     logger.info("SentenceTransformer loaded: %s", EMBED_MODEL_NAME)
 
-    # 문서 로드
-    docs_mem = _load_docs(DATA_JSONL_PATH)
-    logger.info("Docs loaded: %d", len(docs_mem))
+    # 2) 문서 로드
+    DOCS = _load_docs(DATA_JSONL)
+    if not DOCS:
+        logger.error("RAG 초기화 실패: 문서가 없습니다 (%s)", DATA_JSONL)
+        sys.exit(1)
 
-    # 인덱스 로드/빌드
-    if os.path.exists(FAISS_INDEX_PATH):
-        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
-        # 차원 복구용: 하나 질의해서 dim을 채우기보단 모델로부터 얻음
-        sample_vec = _encode_texts(["ping"])
-        dim = sample_vec.shape[1]
-        logger.info("FAISS index loaded: %s (dim=%d)", FAISS_INDEX_PATH, dim)
-    else:
-        faiss_index = _build_index(docs_mem)
+    # 3) FAISS 인덱스 로드
+    if not os.path.exists(FAISS_INDEX_PATH) or not os.path.isfile(FAISS_INDEX_PATH):
+        logger.error("RAG 초기화 실패: FAISS 인덱스가 없습니다 (%s)", FAISS_INDEX_PATH)
+        sys.exit(1)
+    try:
+        FAISS_INDEX = faiss.read_index(FAISS_INDEX_PATH)
+        logger.info("FAISS index loaded: %s", FAISS_INDEX_PATH)
+    except Exception as e:
+        logger.error("FAISS 로드 실패: %s", e)
+        sys.exit(1)
 
-def rag_search(query: str, topk: int = 3) -> str:
-    """메모리 상주 인덱스/문서를 사용하여 컨텍스트 문자열 생성."""
-    if faiss_index is None or docs_mem is None or embedder is None or not docs_mem:
-        return ""
-    q_vec = _encode_texts([query])
-    D, I = faiss_index.search(q_vec, topk)
-    ids = [i for i in I[0] if 0 <= i < len(docs_mem)]
-    if not ids:
-        return ""
-    blocks = []
-    for i in ids:
-        h = docs_mem[i]
-        title = h.get("title") or h.get("id") or "문서"
-        text = (h.get("content") or "")[:1200]
-        blocks.append(f"[{title}]\n{text}...")
-    return "\n\n---\n\n".join(blocks)
+def encode_query(text: str):
+    """bge-ko 쿼리 임베딩 (정규화 권장)"""
+    v = EMBED_MODEL.encode([text], normalize_embeddings=True)
+    return v
 
-def build_rag_prompt(history: list[dict], q: str, context_block: str) -> str:
-    parts = []
-    if context_block.strip():
-        parts.append("### 관련 문서:")
-        parts.append(context_block.strip())
+def rag_search(query: str, topk: int = TOPK) -> List[Dict[str, Any]]:
+    """FAISS로 topk 문서/청크 반환"""
+    if not FAISS_INDEX or not DOCS:
+        return []
+    qv = encode_query(query)
+    D, I = FAISS_INDEX.search(qv, topk)
+    hits: List[Dict[str, Any]] = []
+    for idx in I[0]:
+        if 0 <= idx < len(DOCS):
+            hits.append(DOCS[idx])
+    return hits
+
+def build_prompt(history: List[Dict[str, str]], q: str, contexts: List[Dict[str, Any]]) -> str:
+    """
+    초기 프롬프트 정책:
+    - 컨텍스트(내규)가 있으면: 해당 문서를 근거로 답변 + 관련 법령/사례(요약·설명·링크) 추가
+    - 없으면: 문서 없이 질문만 전달(일반 질의응답)
+    """
+    parts: List[str] = []
+    if contexts:
         parts.append(
-            "\n[지시]\n위의 '관련 문서'를 **핵심 근거**로 답변하세요."
-            " 문서의 내용을 바탕으로 구체적으로 설명하고,"
-            " 한국 법령과 실제 사례를 **추가로** 보완하세요."
-            " 문서에 없는 내용은 단정하지 말고, 필요한 경우 추정이유를 밝히세요."
-            " 답변 말미에 사용한 문서명을 대괄호로 한 번 더 요약 표기하세요."
+            "### 규정 컨텍스트(내규 원문 발췌)\n"
+            "아래는 질문과 관련성이 높은 내규 전문/청크입니다. 이 내용을 우선 근거로 답변하세요.\n"
+        )
+        for i, c in enumerate(contexts, start=1):
+            title = c.get("title") or c.get("id") or f"doc-{i}"
+            ctype = c.get("type", "regulation")
+            content = (c.get("content") or "").strip()
+            parts.append(f"[{i}] 제목: {title} ({ctype})\n{content}\n")
+        parts.append(
+            "### 지시\n"
+            "1) 위 컨텍스트를 중심으로 질문에 답하세요.\n"
+            "2) 답변 끝부분에 관련 법령/시행령/조례 및 사례를 선정·요약·설명하고, 가능한 경우 링크를 제공하세요.\n"
+            "3) 컨텍스트에 포함되지 않은 내용은 추측하지 말고, 모호하면 추가 질문을 제안하세요.\n"
         )
     else:
-        parts.append("### 관련 문서가 없음")
         parts.append(
-            "\n[지시]\n관련 문서가 없으므로 일반적 배경지식을 바탕으로 답변하세요."
-            " 가능한 경우 관련 법령·사례를 함께 제시하세요."
+            "### 지시\n"
+            "컨텍스트가 없으므로 일반 질의응답으로 답하세요. 가능하면 관련 법령/시행령/조례 및 사례도 요약·설명하고 링크를 제시하세요.\n"
         )
 
     if history:
-        parts.append("### 대화 히스토리:")
+        parts.append("### 대화 히스토리(최신이 하단)")
         for m in history:
             who = "사용자" if m.get("role") == "user" else "어시스턴트"
-            parts.append(f"{who}: {m['text']}")
+            text = (m.get("text") or "").strip()
+            parts.append(f"- {who}: {text}")
 
-    parts.append("### 사용자 질문:")
+    parts.append("### 사용자 질문")
     parts.append(q.strip())
+
     return "\n\n".join(parts)
 
 # ---------------------------
-# 스키마
+# Pydantic
 # ---------------------------
 class AskIn(BaseModel):
     question: str
@@ -198,16 +211,21 @@ class AskOut(BaseModel):
     answer: str
 
 # ---------------------------
-# 엔드포인트
+# Startup: RAG 반드시 성공해야 기동
 # ---------------------------
 @app.on_event("startup")
-def _on_startup():
+def on_startup():
     try:
-        _load_index_or_build()
+        _init_rag_or_die()
+    except SystemExit:
+        raise
     except Exception as e:
-        logger.error("RAG 초기화 실패: %s", e)
-        # 인덱스 없이도 서비스는 살아있되, RAG만 빈 컨텍스트가 되도록
+        logger.error("RAG 초기화 중 예외: %s", e)
+        sys.exit(1)
 
+# ---------------------------
+# Routes
+# ---------------------------
 @app.post("/api/ask", response_model=AskOut)
 def ask(payload: AskIn, x_session_id: str = Header(default="")):
     q = (payload.question or "").strip()
@@ -218,59 +236,46 @@ def ask(payload: AskIn, x_session_id: str = Header(default="")):
 
     try:
         history = get_history(x_session_id)
-        context_block = rag_search(q, topk=3)
+        # RAG 검색
+        contexts = rag_search(q, topk=TOPK)
 
-        prompt = build_rag_prompt(history, q, context_block)
+        # 프롬프트 생성
+        prompt = build_prompt(history, q, contexts)
+
+        # LLM 호출 (단일 프롬프트)
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
         )
         answer = getattr(resp, "text", "") or ""
 
+        # 히스토리 저장
         append_history(x_session_id, "user", q)
         append_history(x_session_id, "assistant", answer)
+
         return AskOut(answer=answer)
+
     except Exception as e:
         logger.error("ASK 처리 중 오류: %s", e)
         traceback.print_exc(file=sys.stderr)
         raise HTTPException(500, f"서버 오류: {e}")
 
-@app.post("/api/reindex")
-def reindex():
-    """JSONL이 갱신됐을 때 수동 재색인."""
-    global docs_mem, faiss_index
-    try:
-        docs = _load_docs(DATA_JSONL_PATH)
-        if not docs:
-            raise HTTPException(400, "JSONL 문서가 없습니다.")
-        index = _build_index(docs)
-        docs_mem = docs
-        faiss_index = index
-        return {"ok": True, "docs": len(docs)}
-    except Exception as e:
-        logger.error("재색인 실패: %s", e)
-        raise HTTPException(500, f"재색인 실패: {e}")
-
 @app.get("/api/check")
 def health():
-    return {
-        "ok_gemini": bool(API_KEY),
-        "ok_redis": True
-    }
-
-@app.get("/api/diag")
-def diag():
     info = {
-        "has_api_key": bool(os.environ.get("GOOGLE_API_KEY")),
-        "jsonl_exists": os.path.exists(DATA_JSONL_PATH),
-        "faiss_exists": os.path.exists(FAISS_INDEX_PATH),
-        "docs_loaded": len(docs_mem or []),
-        "index_loaded": faiss_index is not None,
+        "has_api_key": bool(API_KEY),
+        "data_jsonl": DATA_JSONL,
+        "faiss_index": FAISS_INDEX_PATH,
+        "docs_loaded": len(DOCS),
         "embed_model": EMBED_MODEL_NAME,
-        "paths": {"jsonl": DATA_JSONL_PATH, "index": FAISS_INDEX_PATH},
     }
+    # Redis ping
     try:
         info["redis_ping"] = r.ping()
     except Exception as e:
         info["redis_ping"] = f"ERROR: {e}"
     return info
+
+@app.get("/api/hello")
+def hello(name: str | None = None):
+    return {"msg": f"hi {name}" if name else "hi"}
