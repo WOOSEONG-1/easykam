@@ -24,8 +24,6 @@ services:
       - EMBED_MODEL_NAME=BAAI/bge-m3
     ports:
       - "127.0.0.1:8000:8000"
-    volumes:
-      - ./fastapi/data:/app/data:rw  # ← data.jsonl & faiss_index.bin
     env_file:
       - .env
     depends_on:
