@@ -291,8 +291,6 @@ def on_startup():
         logger.error("RAG 초기화 중 예외: %s", e)
         # 전체 스택 출력
         traceback.print_exc()
-        # 서비스 기동 중단
-        sys.exit(1)
 
 @app.post("/api/ask", response_model=AskOut)
 def ask(payload: AskIn, x_session_id: str = Header(default="")):
