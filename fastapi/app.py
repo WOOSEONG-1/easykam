@@ -276,7 +276,8 @@ def check():
         "index_ready": index_ready.is_set(),
         "docs": len(_docs),
         "embed_model": EMBED_MODEL_NAME,
-        "has_api_key": bool(API_KEY),
+        "has_api_key": API_KEY,
+        "REDIS_PASSWORD" : REDIS_PASSWORD
     }
 
 @app.get("/api/diag")
