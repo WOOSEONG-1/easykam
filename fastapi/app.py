@@ -1,3 +1,4 @@
+# app.py
 import os
 import sys
 import json
@@ -16,7 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
-
 from sentence_transformers import SentenceTransformer
 from threading import Lock, Thread
 
@@ -50,7 +50,7 @@ FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "/app/data/faiss_index.bin
 # 검색 상수
 TOPK = int(os.environ.get("RAG_TOPK", "3"))
 
-# Redis (기존 코드 유지)
+# Redis (원본 유지: 필수라고 가정)
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 REDIS_HOST = os.getenv("REDIS_HOST", "easykam-redis")
 REDIS_PORT = os.getenv("REDIS_PORT", "6379")
@@ -62,6 +62,7 @@ try:
     logger.info("Redis OK")
 except Exception as e:
     logger.error("Redis 연결 실패: %s", e)
+    raise
 
 HIST_MAX = int(os.getenv("CHAT_HISTORY_MAX", "20"))
 HIST_TTL = int(os.getenv("CHAT_HISTORY_TTL_SEC", "3600"))
@@ -107,9 +108,9 @@ DOCS: List[Dict[str, Any]] = []   # [{"id","title","type","content"}...]
 RAG_LOCK = Lock()
 
 def _load_embed_model() -> SentenceTransformer:
-    logger.info("Loading SentenceTransformer: %s", EMBED_MODEL_NAME)
+    logger.info("RAG init: Loading SentenceTransformer: %s", EMBED_MODEL_NAME)
     model = SentenceTransformer(EMBED_MODEL_NAME)
-    logger.info("SentenceTransformer loaded: %s", EMBED_MODEL_NAME)
+    logger.info("RAG init: SentenceTransformer loaded: %s", EMBED_MODEL_NAME)
     return model
 
 def _embed_texts(texts: List[str], is_query=False) -> np.ndarray:
@@ -118,8 +119,10 @@ def _embed_texts(texts: List[str], is_query=False) -> np.ndarray:
         texts = [Q_PREFIX + t for t in texts]
     else:
         texts = [D_PREFIX + t for t in texts]
-    vecs = EMBED_MODEL.encode(texts, batch_size=8, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
-    return vecs.astype("float32")
+    return EMBED_MODEL.encode(
+        texts, batch_size=8, show_progress_bar=False,
+        convert_to_numpy=True, normalize_embeddings=True
+    ).astype("float32")
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     docs = []
@@ -133,7 +136,7 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
                 continue
             try:
                 obj = json.loads(line)
-                # 필수 필드 보정
+                # 필수 필드(원본 유지: content 사용)
                 if "content" not in obj or not obj["content"]:
                     continue
                 obj.setdefault("title", obj.get("id", ""))
@@ -148,22 +151,35 @@ def _build_faiss(docs: List[Dict[str, Any]], index_path: str) -> faiss.IndexFlat
     """
     주어진 docs로 FAISS IndexFlatIP를 빌드하고 저장
     """
-    # 문서 임베딩 (content 사용)
+    # ── 추가: 작업 단계 로그 ──
+    t0 = time.perf_counter()
+    logger.info("RAG init: EMBEDDING start (docs=%d)", len(docs))
     contents = [d["content"] for d in docs]
     embs = _embed_texts(contents, is_query=False)  # (N, dim), L2 normed
+    logger.info("RAG init: EMBEDDING done (shape=%s, %.2fs)", getattr(embs, "shape", None), time.perf_counter() - t0)
+
     dim = embs.shape[1]
     index = faiss.IndexFlatIP(dim)  # inner product
+
+    t1 = time.perf_counter()
+    logger.info("RAG init: FAISS build start (dim=%d)", dim)
     index.add(embs)
+    logger.info("RAG init: FAISS build done (added=%d, %.2fs)", len(docs), time.perf_counter() - t1)
 
     # 저장
+    t2 = time.perf_counter()
+    logger.info("RAG init: FAISS write → %s", index_path)
     faiss.write_index(index, index_path)
+    logger.info("RAG init: FAISS saved (path=%s, total=%.2fs)", index_path, time.perf_counter() - t0)
     logger.info("FAISS index built & saved: %s (docs=%d, dim=%d)", index_path, len(docs), dim)
     return index
 
 def _load_faiss(index_path: str) -> faiss.IndexFlatIP:
+    logger.info("RAG init: FAISS load try → %s", index_path)
     if not os.path.exists(index_path) or not os.path.isfile(index_path):
         raise FileNotFoundError(f"FAISS 인덱스가 없습니다: {index_path}")
     index = faiss.read_index(index_path)
+    logger.info("RAG init: FAISS loaded ← %s", index_path)
     logger.info("FAISS index loaded: %s", index_path)
     return index
 
@@ -175,6 +191,9 @@ def _init_rag_or_die():
     """
     global EMBED_MODEL, FAISS_INDEX, DOCS
     with RAG_LOCK:
+        t_all = time.perf_counter()
+        logger.info("RAG init: START (jsonl=%s, index=%s)", DATA_JSONL, FAISS_INDEX_PATH)
+
         # 임베딩 모델
         EMBED_MODEL = _load_embed_model()
 
@@ -184,14 +203,17 @@ def _init_rag_or_die():
         # 인덱스
         if os.path.isfile(FAISS_INDEX_PATH):
             FAISS_INDEX = _load_faiss(FAISS_INDEX_PATH)
+            logger.info("RAG init: END (from existing index, total=%.2fs)", time.perf_counter() - t_all)
             return
 
         if DOCS:
             try:
                 FAISS_INDEX = _build_faiss(DOCS, FAISS_INDEX_PATH)
+                logger.info("RAG init: END (built new index, total=%.2fs)", time.perf_counter() - t_all)
                 return
             except Exception as e:
                 logger.error("FAISS 빌드 실패: %s", e)
+                raise
 
         # 여기 오면 RAG 사용할 수 없음 → 서비스 중단
         raise RuntimeError(
@@ -215,7 +237,6 @@ def rag_search(query: str, topk: int = TOPK) -> Tuple[str, List[Dict[str, Any]]]
             continue
         doc = DOCS[i]
         found.append({"rank": rank, "score": float(score), "doc": doc})
-        # 컨텍스트 블록(문서 제목과 본문)
         title = doc.get("title") or doc.get("id") or f"문서#{i}"
         body = doc.get("content", "")
         parts.append(f"[{rank}] 제목: {title}\n{body}")
@@ -277,10 +298,12 @@ class AskOut(BaseModel):
 # ---------------------------
 @app.on_event("startup")
 def on_startup():
-    # RAG 초기화를 백그라운드로 수행하여 서버 기동을 막지 않음
+    # RAG 초기화를 백그라운드로 수행하여 서버 기동을 막지 않음 (원본 로직 보존)
     def _bg():
         try:
+            logger.info("RAG init thread: START")
             _init_rag_or_die()
+            logger.info("RAG init thread: SUCCESS")
         except Exception as e:
             logger.error("RAG 초기화 중 예외: %s", e)
             traceback.print_exc()
@@ -311,7 +334,7 @@ def ask(payload: AskIn, x_session_id: str = Header(default="")):
         # 3) 프롬프트
         prompt = build_prompt_with_rag(q, history, context_block if has_context else None)
 
-        # 4) LLM 호출
+        # 4) LLM 호출 (최신 SDK: config=GenerateContentConfig)
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
@@ -327,6 +350,8 @@ def ask(payload: AskIn, x_session_id: str = Header(default="")):
 
         return AskOut(answer=answer)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("ASK 처리 중 오류: %s", e)
         traceback.print_exc()
