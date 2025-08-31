@@ -317,9 +317,7 @@ def ask(payload: AskIn, x_session_id: str = Header(default="")):
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
-            generation_config=types.GenerateContentConfig(
-                temperature=payload.temperature or 0.2
-            ),
+            config=types.GenerateContentConfig(temperature=payload.temperature or 0.2),
         )
         answer = getattr(resp, "text", "") or ""
 
