@@ -65,7 +65,7 @@ except Exception as e:
     raise
 
 HIST_MAX = int(os.getenv("CHAT_HISTORY_MAX", "20"))
-HIST_TTL = int(os.getenv("CHAT_HISTORY_TTL_SEC", "3600"))
+HIST_TTL = int(os.getenv("CHAT_HISTORY_TTL_SEC", "1296000"))
 
 def _hist_key(session_id: str) -> str:
     return f"chat:{session_id}:messages"
@@ -120,7 +120,7 @@ def _embed_texts(texts: List[str], is_query=False) -> np.ndarray:
     else:
         texts = [D_PREFIX + t for t in texts]
     return EMBED_MODEL.encode(
-        texts, batch_size=8, show_progress_bar=False,
+        texts, batch_size=16, show_progress_bar=False,
         convert_to_numpy=True, normalize_embeddings=True
     ).astype("float32")
 

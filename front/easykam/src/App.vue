@@ -92,12 +92,51 @@ async function send(q) {
       },
       body: JSON.stringify({ question, session_id: sessionId.value })
     })
-    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+
+    // --- 에러 처리 개선: 백엔드 detail 메시지 우선 사용 ---
+    if (!r.ok) {
+      let usedBackendDetail = false
+      try {
+        const ct = r.headers.get('content-type') || ''
+        if (ct.includes('application/json')) {
+          const err = await r.json()
+          // 1) detail이 문자열이면 그 값만 그대로 출력
+          if (typeof err?.detail === 'string' && err.detail.trim()) {
+            messages.push({ role: 'assistant', text: err.detail.trim() })
+            usedBackendDetail = true
+          }
+          // 2) detail이 배열(FastAPI validation)인 경우 msg들을 묶어서 그대로 출력
+          else if (Array.isArray(err?.detail) && err.detail.length) {
+            const combined = err.detail
+              .map(d => d?.msg || d?.detail || '')
+              .filter(Boolean)
+              .join('\n')
+              .trim()
+            if (combined) {
+              messages.push({ role: 'assistant', text: combined })
+              usedBackendDetail = true
+            }
+          }
+        } else {
+          // JSON이 아니면 text를 읽되, 기존 UX로 폴백하므로 여기선 메시지 직접 푸시 안 함
+          await r.text().catch(() => {})
+        }
+      } catch (e) {
+        // JSON 파싱 실패 → 기존 UX로 폴백
+      }
+      if (usedBackendDetail) return
+      // detail이 없었으면 기존 UX로 폴백
+      throw new Error(`HTTP ${r.status}`)
+    }
+
     const data   = await r.json()
     const answer = data?.answer ?? data?.text ?? JSON.stringify(data)
     messages.push({ role: 'assistant', text: String(answer) })
   } catch (e) {
-    messages.push({ role: 'assistant', text: `오류가 발생했어요. 잠시 후 다시 시도해 주세요.\n(상세: ${e?.message || e})` })
+    messages.push({
+      role: 'assistant',
+      text: `오류가 발생했어요. 잠시 후 다시 시도해 주세요.\n(상세: ${e?.message || e})`
+    })
   } finally {
     loading.value = false
   }
